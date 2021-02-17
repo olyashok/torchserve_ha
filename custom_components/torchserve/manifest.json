@@ -1,0 +1,9 @@
+{
+    "domain": "torchserve",
+    "name": "torchserve image processing integration",
+    "version": "0.1",
+    "documentation": "https://github.com/olyashok",
+    "requirements": ["pillow", "grpcio"],
+    "dependencies": [],
+    "codeowners": []
+}
