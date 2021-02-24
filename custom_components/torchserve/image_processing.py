@@ -9,6 +9,7 @@ import io
 import logging
 import time
 import re
+import json
 from pathlib import Path
 
 from PIL import Image, ImageDraw
@@ -239,7 +240,7 @@ def setup_platform(hass, config, add_devices, discovery_info=None):
     modellist = []
     for modelName, modelUrl in response["models"]:
         modellist.append(modelName)
-    _LOGGER.info(f"Models detected on torchserve are {models}")
+    _LOGGER.info(f"Models detected on torchserve are {modellist}")
 
 
 class ObjectClassifyEntity(ImageProcessingEntity):
@@ -327,57 +328,97 @@ class ObjectClassifyEntity(ImageProcessingEntity):
         img_byte_arr = io.BytesIO(bytearray(image))
         pil_image = Image.open(img_byte_arr)
         self._image_width, self._image_height = pil_image.size
+        images = {">": [img_byte_arr.getvalue()]}
 
         self._objects = []  # The parsed raw data
         self._targets_found = []
         self._summary = {}
         self._state = None
 
-        for model in self._models:
-            _LOGGER.debug(f"Torchserve model {model} detection triggering on {self._name}")
-            tic = time.perf_counter()
-            response = eval(infer_via_rest(self._ip_address, self._port_infer_rest, model, image))
-            toc = time.perf_counter()
+        for pipe in self._models:
+            pipeline = pipe.split("|")
+            pipe_in = pipeline[0]
+            model = pipeline[1].strip()
+            label_map_hash = {}
+            if len(pipeline) > 2:
+                label_map_hash = json.loads(pipeline[2])
 
-            if isinstance(response, str) or (isinstance(response, dict) and 'code' in response.keys()):
-                # error?
-                _LOGGER.critical(f"Torchsever unexpected response {response}")
-                continue
+            labels = pipe_in.split(",")
+            for label in labels:
+                label = label.strip()
+                if label not in images:
+                    continue
+                current_images = images[label]
 
-            self._objects = get_objects(response, model, self._image_width, self._image_height)
+                for current_image in current_images:
+                    _LOGGER.debug(f"Torchserve {model} on {self._name}")
+                    tic = time.perf_counter()
 
-            # filter confidence
-            self._targets_found = [obj for obj in self._objects if (obj["confidence"] > self._confidence)]
-            # filter classes
-            if len(self._targets) > 0:
-                self._targets_found = [obj for obj in self._targets_found if (obj["name"] in self._targets)]
+                    response = eval(infer_via_rest(self._ip_address, self._port_infer_rest, model, current_image))
+                    toc = time.perf_counter()
 
-            if len(self._targets_found) > 0:
-                _LOGGER.info(f"Torchserve model {model} detection on {self._name} ran in {toc-tic}s and returned {response}")
+                    if isinstance(response, str) or (isinstance(response, dict) and 'code' in response.keys()):
+                        _LOGGER.critical(f"Torchsever unexpected response {response}")
+                        continue
 
-            self._state = len(self._targets_found)
+                    all_objects = get_objects(response, model, self._image_width, self._image_height)
 
-            detection_time = dt_util.now().strftime(DATETIME_FORMAT)
-            if (self._state > 0):
-                self._last_detection = detection_time
+                    #top1
+                    if len(all_objects) > 0 and all_objects[0][DATA_PREDICTION_TYPE] == DATA_PREDICTION_TYPE_CLASS:
+                        all_objects = all_objects[:1]
 
-            if self._save_timestamped_file:
-                self.save_image(self._save_file_folder, image, self._targets_found, detection_time)
+                    if len(label_map_hash) > 0:
+                        for obj in all_objects:
+                            if CONF_NAME in obj and obj[CONF_NAME] in label_map_hash:
+                                obj[CONF_NAME] = label_map_hash[obj[CONF_NAME]]
+                                obj[f"{CONF_NAME}_original"] = label_map_hash[obj[CONF_NAME]]
 
-            if (self._fire_events):
-                objnum = 0
-                for target in self._targets_found:
-                    objnum = objnum + 1
-                    target_event_data = target.copy()
-                    target_event_data[ATTR_ENTITY_ID] = self.entity_id
-                    target_event_data[ATTR_LAST_TRIP_TIME] = detection_time
-                    target_event_data[CONF_COUNT] = objnum
-                    target_event_data[DATA_MODEL] = model
-                    target_event_type = "torchserve.{}_detected".format(target_event_data[DATA_PREDICTION_TYPE])
-                    self.hass.bus.fire(target_event_type, target_event_data)
-                    _LOGGER.debug(f"Torchserve event fired {target_event_data}")
-                if objnum > 0:
-                    _LOGGER.debug("Torchserve events fired")
+                    if len(self._targets) > 0:
+                        targets_found = [obj for obj in all_objects if (obj["name"] in self._targets)]
+                    targets_found = [obj for obj in targets_found if (obj["confidence"] > self._confidence)]
+
+                    for obj in targets_found:
+                        if DATA_BOX in obj:
+                            box = obj[DATA_BOX]
+                            imc = pil_image.crop((box["x_min"] * self._image_width, box["y_min"] * self._image_height, box["x_max"] * self._image_width, box["y_max"] * self._image_height))
+                            img_byte_arr = io.BytesIO()
+                            imc.save(img_byte_arr, format='JPEG')
+                            img_byte_arr = img_byte_arr.getvalue()
+                            if obj[CONF_NAME] not in images:
+                                crops = []
+                                images[obj[CONF_NAME]] = crops
+                            else:
+                                crops = images[obj[CONF_NAME]]
+                            crops.append(img_byte_arr)
+
+                    if len(targets_found) > 0:
+                        _LOGGER.info(f"Torchserve {model} on {self._name} ran in {toc-tic}s and returned {response}")
+                        self._targets_found.extend(targets_found)
+
+                    self._objects.extend(all_objects)
+
+        self._state = len(self._targets_found)
+
+        detection_time = dt_util.now().strftime(DATETIME_FORMAT)
+        if (self._state > 0):
+            self._last_detection = detection_time
+
+        if self._save_timestamped_file or self._save_latest:
+            self.save_image(self._save_file_folder, pil_image, self._targets_found, detection_time)
+
+        if (self._fire_events):
+            objnum = 0
+            for target in self._targets_found:
+                objnum = objnum + 1
+                target_event_data = target.copy()
+                target_event_data[ATTR_ENTITY_ID] = self.entity_id
+                target_event_data[ATTR_LAST_TRIP_TIME] = detection_time
+                target_event_data[CONF_COUNT] = objnum
+                target_event_type = "torchserve.{}_detected".format(target_event_data[DATA_PREDICTION_TYPE])
+                self.hass.bus.fire(target_event_type, target_event_data)
+                _LOGGER.debug(f"Torchserve event fired {target_event_data}")
+            if objnum > 0:
+                _LOGGER.debug("Torchserve events fired")
 
     @property
     def camera_entity(self):
@@ -418,11 +459,10 @@ class ObjectClassifyEntity(ImageProcessingEntity):
         attr["objects"] = self._objects
         return attr
 
-    def save_image(self, directory, image, objects, stamp):
+    def save_image(self, directory, img, objects, stamp):
         """Save image files."""
         _LOGGER.debug("Torchserve saving files")
         """Draws the actual bounding box of the detected objects."""
-        img = Image.open(io.BytesIO(bytearray(image))).convert("RGB")
         imgc = img.copy()
 
         if self._show_boxes:
