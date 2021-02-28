@@ -21,6 +21,7 @@ from homeassistant.util.pil import draw_box
 
 import grpc
 import requests
+import uuid
 
 import custom_components.torchserve.inference_pb2_grpc as inference_pb2_grpc
 import custom_components.torchserve.management_pb2_grpc as management_pb2_grpc
@@ -37,7 +38,9 @@ from homeassistant.const import (
     ATTR_ENTITY_ID,
     ATTR_LAST_TRIP_TIME,
     CONF_IP_ADDRESS,
-    CONF_COUNT,
+    CONF_FILE_PATH,
+    CONF_UNIQUE_ID,
+    ATTR_ENTITY_PICTURE
 )
 from homeassistant.core import split_entity_id
 
@@ -116,7 +119,7 @@ def get_valid_filename(name: str) -> str:
     return re.sub(r"(?u)[^-\w.]", "", str(name).strip().replace(" ", "_"))
 
 
-def get_objects(predictions: list, model: str, img_width: int, img_height: int):
+def get_objects(cropid: str, predictions: list, model: str, img_width: int, img_height: int):
     """Return objects with formatting and extra info."""
     objects = []
     decimal_places = 3
@@ -145,6 +148,8 @@ def get_objects(predictions: list, model: str, img_width: int, img_height: int):
                     ATTR_CONFIDENCE: confidence * 100,
                     DATA_MODEL: model,
                     DATA_PREDICTION_TYPE: DATA_PREDICTION_TYPE_CLASS,
+                    CONF_UNIQUE_ID: uuid.uuid4().hex,
+                    ATTR_ENTITY_PICTURE: cropid
                 }
             )
     else:
@@ -179,6 +184,8 @@ def get_objects(predictions: list, model: str, img_width: int, img_height: int):
                     DATA_MODEL: model,
                     ATTR_CONFIDENCE: confidence,
                     DATA_PREDICTION_TYPE: DATA_PREDICTION_TYPE_OBJECT,
+                    CONF_UNIQUE_ID: uuid.uuid4().hex,
+                    ATTR_ENTITY_PICTURE: cropid
                 }
             )
     return objects
@@ -328,7 +335,7 @@ class ObjectClassifyEntity(ImageProcessingEntity):
         img_byte_arr = io.BytesIO(bytearray(image))
         pil_image = Image.open(img_byte_arr)
         self._image_width, self._image_height = pil_image.size
-        images = {">": [img_byte_arr.getvalue()]}
+        images = {">": [{"image": img_byte_arr.getvalue(), "cropid": uuid.uuid4().hex}]}
 
         self._objects = []  # The parsed raw data
         self._targets_found = []
@@ -350,7 +357,9 @@ class ObjectClassifyEntity(ImageProcessingEntity):
                     continue
                 current_images = images[label]
 
-                for current_image in current_images:
+                for index in range(len(current_images)):
+                    current_image = current_images[index]['image']
+                    cropid = current_images[index]['cropid']
                     _LOGGER.debug(f"Torchserve {model} on {self._name}")
                     tic = time.perf_counter()
 
@@ -361,7 +370,7 @@ class ObjectClassifyEntity(ImageProcessingEntity):
                         _LOGGER.critical(f"Torchsever unexpected response {response}")
                         continue
 
-                    all_objects = get_objects(response, model, self._image_width, self._image_height)
+                    all_objects = get_objects(cropid, response, model, self._image_width, self._image_height)
 
                     #top1
                     if len(all_objects) > 0 and all_objects[0][DATA_PREDICTION_TYPE] == DATA_PREDICTION_TYPE_CLASS:
@@ -370,26 +379,28 @@ class ObjectClassifyEntity(ImageProcessingEntity):
                     if len(label_map_hash) > 0:
                         for obj in all_objects:
                             if CONF_NAME in obj and obj[CONF_NAME] in label_map_hash:
+                                obj[f"{CONF_NAME}_original"] = obj[CONF_NAME]
                                 obj[CONF_NAME] = label_map_hash[obj[CONF_NAME]]
-                                obj[f"{CONF_NAME}_original"] = label_map_hash[obj[CONF_NAME]]
 
+                    targets_found = all_objects
                     if len(self._targets) > 0:
                         targets_found = [obj for obj in all_objects if (obj["name"] in self._targets)]
                     targets_found = [obj for obj in targets_found if (obj["confidence"] > self._confidence)]
 
-                    for obj in targets_found:
-                        if DATA_BOX in obj:
-                            box = obj[DATA_BOX]
-                            imc = pil_image.crop((box["x_min"] * self._image_width, box["y_min"] * self._image_height, box["x_max"] * self._image_width, box["y_max"] * self._image_height))
-                            img_byte_arr = io.BytesIO()
-                            imc.save(img_byte_arr, format='JPEG')
-                            img_byte_arr = img_byte_arr.getvalue()
-                            if obj[CONF_NAME] not in images:
-                                crops = []
-                                images[obj[CONF_NAME]] = crops
-                            else:
-                                crops = images[obj[CONF_NAME]]
-                            crops.append(img_byte_arr)
+                    if len(targets_found) > 0 and targets_found[0][DATA_PREDICTION_TYPE] != DATA_PREDICTION_TYPE_CLASS:
+                        for obj in targets_found:
+                            if DATA_BOX in obj:
+                                box = obj[DATA_BOX]
+                                imc = pil_image.crop((box["x_min"] * self._image_width, box["y_min"] * self._image_height, box["x_max"] * self._image_width, box["y_max"] * self._image_height))
+                                img_byte_arr = io.BytesIO()
+                                imc.save(img_byte_arr, format='JPEG')
+                                img_byte_arr = img_byte_arr.getvalue()
+                                if obj[CONF_NAME] not in images:
+                                    crops = []
+                                    images[obj[CONF_NAME]] = crops
+                                else:
+                                    crops = images[obj[CONF_NAME]]
+                                crops.append({"image": img_byte_arr, "cropid": obj[CONF_UNIQUE_ID]})
 
                     if len(targets_found) > 0:
                         _LOGGER.info(f"Torchserve {model} on {self._name} ran in {toc-tic}s and returned {response}")
@@ -407,18 +418,13 @@ class ObjectClassifyEntity(ImageProcessingEntity):
             self.save_image(self._save_file_folder, pil_image, self._targets_found, detection_time)
 
         if (self._fire_events):
-            objnum = 0
             for target in self._targets_found:
-                objnum = objnum + 1
                 target_event_data = target.copy()
                 target_event_data[ATTR_ENTITY_ID] = self.entity_id
                 target_event_data[ATTR_LAST_TRIP_TIME] = detection_time
-                target_event_data[CONF_COUNT] = objnum
-                target_event_type = "torchserve.{}_detected".format(target_event_data[DATA_PREDICTION_TYPE])
+                target_event_type = "torchserve.object_detected"
                 self.hass.bus.fire(target_event_type, target_event_data)
                 _LOGGER.debug(f"Torchserve event fired {target_event_data}")
-            if objnum > 0:
-                _LOGGER.debug("Torchserve events fired")
 
     @property
     def camera_entity(self):
@@ -468,40 +474,48 @@ class ObjectClassifyEntity(ImageProcessingEntity):
         if self._show_boxes:
             draw = ImageDraw.Draw(img)
 
+        saved_crops = {}
         prefix = f"{get_valid_filename(self._name).lower()}"
 
-        objnum = 1
         for obj in objects:
-            name = obj["name"]
-            confidence = obj["confidence"]
-            model = obj["model"]
-            box_label = f"{name}: {confidence:.1f}%"
-            prediction_type = obj["prediction_type"]
-
-            if "bounding_box" in obj:
-                box = obj["bounding_box"]
-                centroid = obj["centroid"]
-
-                if self._save_cropped_file:
-                    imc = imgc.crop((box["x_min"] * img.width, box["y_min"] * img.height, box["x_max"] * img.width, box["y_max"] * img.height))
-                    if self._save_timestamped_file:
-                        crop_save_path = directory / f"{prefix}_{stamp}_{model}_{prediction_type}_{name}_{objnum}.jpg"
-                        imc.save(crop_save_path)
-                    if self._save_latest:
-                        crop_save_path = directory / f"{prefix}_latest_{model}_{prediction_type}_{name}.jpg"
-                        imc.save(crop_save_path)
-                    _LOGGER.debug("Torchserve saved crops")
+            label = obj[CONF_NAME]
+            confidence = obj[ATTR_CONFIDENCE]
+            model = obj[DATA_MODEL]
+            box_label = f"{label}: {confidence:.1f}%"
+            prediction_type = obj[DATA_PREDICTION_TYPE]
+            box = obj[DATA_BOX]
+            centroid = obj[DATA_CENTROID]
+            predid = obj[CONF_UNIQUE_ID]
+            imageid = obj[ATTR_ENTITY_PICTURE]
 
             if self._save_label_data:
                 label_path = directory / "labels.csv"
                 with open(label_path, "a+") as f:
-                    timestamp_save_path = directory / f"{self._name}_{stamp}_nobox.jpg"
-                    f.write("{},{},{},{},{},{},{},{},{}\n".format(timestamp_save_path, int(box["x_min"] * img.width), int(box["y_min"] * img.height), int(box["x_max"] * img.width), int(box["y_max"] * img.height), model, name, objnum, confidence))
-                _LOGGER.debug("Torchserve saved labels")
+                    f.write("{},{},{},{},{},{},{},{},{}\n".format(
+                        predid,
+                        imageid,
+                        int(box["x_min"] * img.width), int(box["y_min"] * img.height), int(box["x_max"] * img.width), int(box["y_max"] * img.height),
+                        model,
+                        label,
+                        confidence))
+                #_LOGGER.debug("Torchserve saved labels")
 
-            objnum = objnum + 1
+            if self._save_cropped_file:
+                if prediction_type == DATA_PREDICTION_TYPE_OBJECT:
+                    imc = imgc.crop((box["x_min"] * img.width, box["y_min"] * img.height, box["x_max"] * img.width, box["y_max"] * img.height))
+                    if self._save_timestamped_file:
+                        crop_save_path = directory / f"{prefix}_{stamp}_{model}_{prediction_type}_{label}_{predid}.jpg"
+                        imc.save(crop_save_path)
+                        obj[CONF_FILE_PATH] = f"{crop_save_path}"
+                        saved_crops[predid] = obj[CONF_FILE_PATH]
+                    if self._save_latest:
+                        crop_save_path = directory / f"{prefix}_latest_{prediction_type}_{label}.jpg"
+                        imc.save(crop_save_path)
+                    #_LOGGER.debug("Torchserve saved crops")
+                else:
+                    obj[CONF_FILE_PATH] = saved_crops[imageid]
 
-            if self._show_boxes:
+            if self._show_boxes and prediction_type == DATA_PREDICTION_TYPE_OBJECT:
                 box_colour = YELLOW
 
                 draw_box(
@@ -521,9 +535,10 @@ class ObjectClassifyEntity(ImageProcessingEntity):
                 )
 
         if (len(objects) > 0 or self._save_blanks):
-            suffix = ""
             if (self._save_blanks and not len(objects) > 0):
                 suffix = "_blank"
+            else:
+                suffix = ""
 
             if self._save_latest:
                 if self._show_boxes:
@@ -538,4 +553,4 @@ class ObjectClassifyEntity(ImageProcessingEntity):
                     img.save(timestamp_save_path)
                 timestamp_save_path = directory / f"{prefix}_{stamp}_nobox{suffix}.jpg"
                 imgc.save(timestamp_save_path)
-            _LOGGER.debug("Torchserve saved uncropped images")
+            #_LOGGER.debug("Torchserve saved uncropped images")
