@@ -13,6 +13,7 @@ import json
 from pathlib import Path
 
 from PIL import Image, ImageDraw
+from shutil import copyfile
 
 import homeassistant.helpers.config_validation as cv
 import homeassistant.util.dt as dt_util
@@ -194,7 +195,7 @@ def get_objects(cropid: str, predictions: list, model: str, img_width: int, img_
 def infer_via_rest(host, port, model_name, model_input):
     """Run inference via REST."""
     url = f"http://{host}:{port}/predictions/{model_name}"
-    prediction = requests.post(url, data=model_input).text
+    prediction = requests.post(url, data=model_input, timeout=(5, 1)).text
     return prediction
 
 
@@ -244,10 +245,7 @@ def setup_platform(hass, config, add_devices, discovery_info=None):
     add_devices(entities)
 
     response = eval(get_model_list_via_rest(config.get(CONF_IP_ADDRESS), config.get(CONF_PORT_MGMT_REST)))
-    modellist = []
-    for modelName, modelUrl in response["models"]:
-        modellist.append(modelName)
-    _LOGGER.info(f"Models detected on torchserve are {modellist}")
+    _LOGGER.info(f"Models detected on torchserve are {response['models']}")
 
 
 class ObjectClassifyEntity(ImageProcessingEntity):
@@ -294,7 +292,7 @@ class ObjectClassifyEntity(ImageProcessingEntity):
             camera_name = split_entity_id(camera_entity)[1]
             self._name = "torchserve_{}".format(camera_name)
 
-        _LOGGER.debug("Torchserve camera initializing as {}".format(self._name))
+        _LOGGER.info("Torchserve camera initializing as {}".format(self._name))
 
         self._save_file_folder = save_file_folder
         self._save_timestamped_file = save_timestamped_file
@@ -335,7 +333,7 @@ class ObjectClassifyEntity(ImageProcessingEntity):
         img_byte_arr = io.BytesIO(bytearray(image))
         pil_image = Image.open(img_byte_arr)
         self._image_width, self._image_height = pil_image.size
-        images = {">": [{"image": img_byte_arr.getvalue(), "cropid": uuid.uuid4().hex}]}
+        images = {">": [{"image": img_byte_arr.getvalue(), "cropid": uuid.uuid4().hex, "width": self._image_width, "height": self._image_height}]}
 
         self._objects = []  # The parsed raw data
         self._targets_found = []
@@ -345,53 +343,94 @@ class ObjectClassifyEntity(ImageProcessingEntity):
         for pipe in self._models:
             pipeline = pipe.split("|")
             pipe_in = pipeline[0]
+            filter_in = pipeline[3].strip()
             model = pipeline[1].strip()
             label_map_hash = {}
-            if len(pipeline) > 2:
-                label_map_hash = json.loads(pipeline[2])
+            if len(pipeline) > 3:
+                label_map = json.loads(pipeline[2])
+                for labels in label_map.keys():
+                    out = label_map[labels]
+                    ind_lables = labels.split(",")
+                    for label in ind_lables:
+                        label_map_hash[label.strip()] = out
 
             labels = pipe_in.split(",")
             for label in labels:
                 label = label.strip()
                 if label not in images:
                     continue
+
                 current_images = images[label]
+                targets_found = []
+                filtered = []
 
                 for index in range(len(current_images)):
                     current_image = current_images[index]['image']
+                    current_width = current_images[index]['width']
+                    current_height = current_images[index]['height']
                     cropid = current_images[index]['cropid']
-                    _LOGGER.debug(f"Torchserve {model} on {self._name}")
+
                     tic = time.perf_counter()
 
                     response = eval(infer_via_rest(self._ip_address, self._port_infer_rest, model, current_image))
                     toc = time.perf_counter()
 
+                    _LOGGER.debug(f"Torchserve {model} on {self._name} ran in {toc-tic}s and returned {response}")
+
                     if isinstance(response, str) or (isinstance(response, dict) and 'code' in response.keys()):
                         _LOGGER.critical(f"Torchsever unexpected response {response}")
                         continue
 
-                    all_objects = get_objects(cropid, response, model, self._image_width, self._image_height)
+                    all_objects = get_objects(cropid, response, model, current_width, current_height)
 
                     #top1
                     if len(all_objects) > 0 and all_objects[0][DATA_PREDICTION_TYPE] == DATA_PREDICTION_TYPE_CLASS:
                         all_objects = all_objects[:1]
 
+                    filtered = []
                     if len(label_map_hash) > 0:
                         for obj in all_objects:
-                            if CONF_NAME in obj and obj[CONF_NAME] in label_map_hash:
-                                obj[f"{CONF_NAME}_original"] = obj[CONF_NAME]
-                                obj[CONF_NAME] = label_map_hash[obj[CONF_NAME]]
+                            if obj[CONF_NAME] in label_map_hash:
+                                if "null" not in label_map_hash[obj[CONF_NAME]]:
+                                    if ">" not in label_map_hash[obj[CONF_NAME]]:
+                                        obj[f"{CONF_NAME}_original"] = obj[CONF_NAME]
+                                        obj[CONF_NAME] = label_map_hash[obj[CONF_NAME]]
+                                    filtered.append(obj)
+                            elif "*" in label_map_hash:
+                                if "null" not in label_map_hash["*"]:
+                                    if ">" not in label_map_hash["*"]:
+                                        obj[f"{CONF_NAME}_original"] = obj[CONF_NAME]
+                                        obj[CONF_NAME] = label_map_hash["*"]
+                                    filtered.append(obj)
+                    else:
+                        filtered = all_objects
 
-                    targets_found = all_objects
+                    #apply filters
+                    all_objects = filtered
+                    filtered = []
+                    if "*" != filter_in:
+                        label_filters = eval(filter_in)
+                        for obj in all_objects:
+                            label_filter_eval = eval(label_filters)
+                            if label_filter_eval:
+                                filtered.append(obj)
+                    else:
+                        filtered = all_objects
+
+                    targets_found = filtered
                     if len(self._targets) > 0:
-                        targets_found = [obj for obj in all_objects if (obj["name"] in self._targets)]
+                        targets_found = [obj for obj in targets_found if (obj["name"] in self._targets)]
                     targets_found = [obj for obj in targets_found if (obj["confidence"] > self._confidence)]
 
+                    _LOGGER.debug(f"Torchserve {model} on {self._name} ran in {toc-tic}s and was pipelined to {targets_found}")
+
+                    #pipe crops
                     if len(targets_found) > 0 and targets_found[0][DATA_PREDICTION_TYPE] != DATA_PREDICTION_TYPE_CLASS:
                         for obj in targets_found:
                             if DATA_BOX in obj:
                                 box = obj[DATA_BOX]
                                 imc = pil_image.crop((box["x_min"] * self._image_width, box["y_min"] * self._image_height, box["x_max"] * self._image_width, box["y_max"] * self._image_height))
+                                crop_width, crop_height = imc.size
                                 img_byte_arr = io.BytesIO()
                                 imc.save(img_byte_arr, format='JPEG')
                                 img_byte_arr = img_byte_arr.getvalue()
@@ -400,21 +439,17 @@ class ObjectClassifyEntity(ImageProcessingEntity):
                                     images[obj[CONF_NAME]] = crops
                                 else:
                                     crops = images[obj[CONF_NAME]]
-                                crops.append({"image": img_byte_arr, "cropid": obj[CONF_UNIQUE_ID]})
+                                crops.append({"image": img_byte_arr, "cropid": obj[CONF_UNIQUE_ID], "width": crop_width, "height": crop_height, "obj": obj})
 
-                    if len(targets_found) > 0:
-                        _LOGGER.info(f"Torchserve {model} on {self._name} ran in {toc-tic}s and returned {response}")
-                        self._targets_found.extend(targets_found)
-
-                    self._objects.extend(all_objects)
-
-        self._state = len(self._targets_found)
+                    self._objects.extend(filtered)
+                    self._targets_found.extend(targets_found)
+                self._state = len(self._targets_found)
 
         detection_time = dt_util.now().strftime(DATETIME_FORMAT)
         if (self._state > 0):
             self._last_detection = detection_time
 
-        if self._save_timestamped_file or self._save_latest:
+        if len(self._targets_found) > 0 and (self._save_timestamped_file or self._save_latest):
             self.save_image(self._save_file_folder, pil_image, self._targets_found, detection_time)
 
         if (self._fire_events):
@@ -424,7 +459,7 @@ class ObjectClassifyEntity(ImageProcessingEntity):
                 target_event_data[ATTR_LAST_TRIP_TIME] = detection_time
                 target_event_type = "torchserve.object_detected"
                 self.hass.bus.fire(target_event_type, target_event_data)
-                _LOGGER.debug(f"Torchserve event fired {target_event_data}")
+                _LOGGER.info(f"Torchserve event fired {target_event_data}")
 
     @property
     def camera_entity(self):
@@ -467,7 +502,6 @@ class ObjectClassifyEntity(ImageProcessingEntity):
 
     def save_image(self, directory, img, objects, stamp):
         """Save image files."""
-        _LOGGER.debug("Torchserve saving files")
         """Draws the actual bounding box of the detected objects."""
         imgc = img.copy()
 
@@ -484,20 +518,26 @@ class ObjectClassifyEntity(ImageProcessingEntity):
             box_label = f"{label}: {confidence:.1f}%"
             prediction_type = obj[DATA_PREDICTION_TYPE]
             box = obj[DATA_BOX]
+            box_area = obj[DATA_BOX_AREA]
             centroid = obj[DATA_CENTROID]
             predid = obj[CONF_UNIQUE_ID]
             imageid = obj[ATTR_ENTITY_PICTURE]
+            entity_id = prefix
 
             if self._save_label_data:
                 label_path = directory / "labels.csv"
                 with open(label_path, "a+") as f:
-                    f.write("{},{},{},{},{},{},{},{},{}\n".format(
+                    f.write("{},{},{},{},{},{},{},{},{},{},{},{}\n".format(
+                        stamp,
                         predid,
                         imageid,
-                        int(box["x_min"] * img.width), int(box["y_min"] * img.height), int(box["x_max"] * img.width), int(box["y_max"] * img.height),
+                        entity_id,
                         model,
+                        confidence,
                         label,
-                        confidence))
+                        box_area,
+                        int(box["x_min"] * img.width), int(box["y_min"] * img.height), int(box["x_max"] * img.width), int(box["y_max"] * img.height),
+                        ))
                 #_LOGGER.debug("Torchserve saved labels")
 
             if self._save_cropped_file:
@@ -514,6 +554,8 @@ class ObjectClassifyEntity(ImageProcessingEntity):
                     #_LOGGER.debug("Torchserve saved crops")
                 else:
                     obj[CONF_FILE_PATH] = saved_crops[imageid]
+                    classified_crop_path = directory / f"{prefix}_{stamp}_{model}_{prediction_type}_{label}_{predid}.jpg"
+                    copyfile(obj[CONF_FILE_PATH], classified_crop_path)
 
             if self._show_boxes and prediction_type == DATA_PREDICTION_TYPE_OBJECT:
                 box_colour = YELLOW
